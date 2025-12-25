@@ -2,174 +2,192 @@
 
 // --- 全局状态 ---
 let isRunning = false;
-let processedTweetIds = new Set();
-// let scrollIntervalId = null; // [已移除] 不再需要自动滚动定时器
-let scanObserver = null;
-let replyQueue = [];
+let processedTweetIds = new Set(); // 仍然需要记录已处理ID，防止重复回复同一条
 let isProcessingReply = false;
 
 const AI_ICON = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z"/><path d="M12 6a1 1 0 0 0-1 1v2H9a1 1 0 0 0 0 2h2v2a1 1 0 0 0 2 0v-2h2a1 1 0 0 0 0-2h-2V7a1 1 0 0 0-1-1z"/></svg>`;
 
-// --- 初始化与消息监听 ---
+// --- 初始化 ---
 
-// 1. 发送握手信号
+// 1. 握手
 chrome.runtime.sendMessage({ type: "CONTENT_READY" });
 
-// 2. 初始状态检查 (页面刷新后会执行这里)
+// 2. 检查自动运行状态 (页面刷新后)
 chrome.storage.local.get(['isRunning'], (data) => {
   if (data.isRunning) {
-    // 稍微延迟一下，确保页面 DOM 加载了一部分
-    setTimeout(startAutomation, 1500);
+    // 页面刚刷新，给一点时间让推特加载内容
+    setTimeout(startAutomation, 3000);
   }
 });
 
-// 3. 监听来自 Background 的消息
+// 3. 监听消息
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (req.type === "STATE_CHANGE") {
-    const { isRunning: shouldRun } = req.payload;
-    if (shouldRun) {
-      startAutomation();
-    } else {
-      stopAutomation();
-    }
+    if (req.payload.isRunning) startAutomation();
+    else stopAutomation();
   }
   return true;
 });
 
-// 手动按钮注入
-const manualObserver = new MutationObserver((mutations) => {
-  if (!isRunning) { // 只有在不运行时才积极注入手动按钮，节省性能
-      for (const mutation of mutations) {
-        if (mutation.addedNodes.length) {
-          injectButtons();
-        }
-      }
-  }
-});
-manualObserver.observe(document.body, { childList: true, subtree: true });
-
-
-// --- 自动化核心逻辑 ---
+// --- 自动化主循环 (核心改变) ---
 
 async function startAutomation() {
   if (isRunning) return;
   isRunning = true;
-  console.log("AI 助手：开始自动运行...");
-
-  processedTweetIds.clear();
-
-  // [修改] 移除了 scrollIntervalId 相关的 setInterval 代码
-  // 不再自动滚动，依靠 scanObserver 捕捉当前屏，回复成功后才滚动
-
-  // 1. 启动扫描
-  scanObserver = new MutationObserver((mutations) => {
-    if (!isRunning) return;
-    mutations.forEach(mutation => {
-      mutation.addedNodes.forEach(node => {
-        if (node.nodeType === 1) {
-          if (node.tagName === 'ARTICLE' && node.getAttribute('data-testid') === 'tweet') {
-             enqueueTweet(node);
-          }
-          const tweets = node.querySelectorAll ? node.querySelectorAll('article[data-testid="tweet"]') : [];
-          tweets.forEach(tweet => enqueueTweet(tweet));
-        }
-      });
-    });
-  });
-
-  scanObserver.observe(document.body, { childList: true, subtree: true });
-
-  // 2. 立即扫描一次当前页面
-  const existingTweets = document.querySelectorAll('article[data-testid="tweet"]');
-  existingTweets.forEach(t => enqueueTweet(t));
-
-  // 3. 启动队列处理
-  processReplyQueue();
+  console.log("AI 助手：开始运行 (即时模式)...");
+  
+  // 开始无限循环
+  automationLoop();
 }
 
 function stopAutomation() {
   isRunning = false;
   console.log("AI 助手：停止运行");
-
-  // 立即清空队列
-  replyQueue = [];
-
-  if (scanObserver) {
-    scanObserver.disconnect();
-    scanObserver = null;
-  }
-  // scrollIntervalId 已移除，无需清除
 }
 
-// --- 推文过滤与排队 ---
+async function automationLoop() {
+  while (isRunning) {
+    // 1. 在当前视图中寻找一个可回复的推文
+    const candidate = findBestCandidate();
 
-function enqueueTweet(tweetElement) {
-  if (!isRunning) return;
-
-  const tweetId = getTweetId(tweetElement);
-  if (!tweetId || processedTweetIds.has(tweetId)) {
-    return;
-  }
-
-  // 过滤广告
-  if (tweetElement.innerText.includes("Ad") || tweetElement.innerText.includes("Promoted") || tweetElement.innerText.includes("广告")) {
-      return;
-  }
-
-  // 过滤主贴
-  if (isMainTweet(tweetElement)) {
-    processedTweetIds.add(tweetId);
-    return;
-  }
-
-  processedTweetIds.add(tweetId);
-  replyQueue.push(tweetElement);
-  updateCount();
-}
-
-function getTweetId(tweetElement) {
-  const link = tweetElement.querySelector('a[href*="/status/"]');
-  if (link) {
-    const parts = link.href.split('/status/');
-    if (parts.length > 1) {
-      return parts[1].split('/')[0];
+    if (candidate) {
+      // 2. 如果找到了，执行回复流程 (这里面包含了 2-3 分钟的等待)
+      await triggerAutoReply(candidate);
+    } else {
+      // 3. 如果当前屏幕没有合适的 (全是广告 or 已回复)，小幅度滚动寻找
+      console.log("当前屏幕无合适推文，向下搜寻...");
+      window.scrollBy({ top: 300, behavior: 'smooth' });
+      await randomDelay(2000, 3000); // 等待滚动加载
     }
+    
+    // 这里的循环不需要额外的 sleep，因为 triggerAutoReply 内部有长等待，
+    // 或者 else 分支有短等待。
+  }
+}
+
+// --- 寻找合适的推文 ---
+
+function findBestCandidate() {
+  // 获取当前页面所有推文
+  const allTweets = document.querySelectorAll('article[data-testid="tweet"]');
+  
+  for (let tweet of allTweets) {
+    // 1. 基础检查：是否已处理、是否可见
+    if (!isInViewport(tweet)) continue; // 只处理视口内的，模拟人类浏览
+    
+    const id = getTweetId(tweet);
+    if (!id || processedTweetIds.has(id)) continue;
+
+    // 2. 内容过滤
+    const text = tweet.innerText;
+    if (text.includes("Ad") || text.includes("Promoted") || text.includes("广告")) continue;
+    
+    // 3. 排除主贴 (如果是详情页)
+    if (isMainTweet(tweet)) {
+        processedTweetIds.add(id); // 标记主贴已读，但不回复
+        continue; 
+    }
+
+    // 找到第一个符合条件的，立即返回
+    return tweet;
   }
   return null;
 }
 
-function isMainTweet(tweetElement) {
-    const pathname = window.location.pathname;
-    if (pathname === '/' || pathname === '/home') return false; 
-    
-    const tweetUrl = tweetElement.querySelector('a[href*="/status/"]')?.href;
-    if (tweetUrl && pathname.includes('/status/') && tweetUrl.includes(pathname.split('/status/')[1].split('/')[0])) {
-        return true;
-    }
-    return false;
+// 检查元素是否在视口内 (或者接近视口)
+function isInViewport(el) {
+    const rect = el.getBoundingClientRect();
+    // 只要头部在屏幕下方 1/3 处以上，且没有滚出屏幕上方太多
+    return (
+        rect.top >= -200 && 
+        rect.top <= (window.innerHeight || document.documentElement.clientHeight)
+    );
 }
 
-// --- 队列处理 ---
+// --- 自动化执行流程 ---
 
-async function processReplyQueue() {
-  while (isRunning) { // 循环条件本身就是第一道防线
-    if (replyQueue.length > 0 && !isProcessingReply) {
-      const tweetElement = replyQueue.shift();
-      // 再次检查元素是否还在文档中
-      if (document.body.contains(tweetElement)) {
-          await triggerAutoReply(tweetElement);
-      }
+async function triggerAutoReply(tweetElement) {
+  if (!isRunning) return;
+  isProcessingReply = true;
+
+  const tweetId = getTweetId(tweetElement);
+  processedTweetIds.add(tweetId); // 立即标记，防止重复
+
+  try {
+    // 1. 滚动到该元素 (对齐)
+    tweetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    await randomDelay(1500, 2500);
+    if (!isRunning) return;
+
+    // 2. 获取文本
+    const textNode = tweetElement.querySelector('div[data-testid="tweetText"]');
+    const tweetText = textNode ? textNode.innerText : "";
+    if (!tweetText) {
+        console.log("推文无文本，跳过");
+        return;
     }
-    // 稍微等待，避免死循环占用 CPU
+
+    console.log(`正在处理: ${tweetText.slice(0, 20)}...`);
+
+    // 3. AI 生成
+    const replyText = await generateReplyFromAI(tweetText);
+    if (!isRunning) return;
+    console.log(`AI 回复: ${replyText}`);
+
+    // 4. 打开回复框
+    const replyButton = tweetElement.querySelector('button[data-testid="reply"]');
+    if (!replyButton) throw new Error("无回复按钮");
+    replyButton.click();
+
+    // 5. 等待输入框
+    const inputBox = await waitForElement('div[role="dialog"] div[role="textbox"]', 5000);
+    if (!inputBox) throw new Error("输入框未出现");
+    if (!isRunning) { closeDialog(); return; }
+
+    // 6. 输入与发送
+    await simulateReactInput(inputBox, replyText);
     await randomDelay(1000, 2000);
+    if (!isRunning) { closeDialog(); return; }
+
+    const sent = await clickSendButton();
+
+    if (sent) {
+        updateCount(1);
+        console.log("✅ 发送成功");
+        await randomDelay(3000, 5000);
+        window.scrollBy({ top: 1200, behavior: 'smooth' });
+
+        // --- 核心等待：2-3 分钟 ---
+        console.log("⏳ 进入冷却：等待 2-3 分钟...");
+        // 120秒 ~ 180秒
+        await randomDelay(120 * 1000, 180 * 1000);
+        window.scrollBy({ top: 600, behavior: 'smooth' });
+        
+        // 冷却结束后，大幅滚动一次，准备寻找下一个
+        if (isRunning) {
+            console.log("🔄 冷却结束，翻页寻找新内容...");
+            
+            await randomDelay(2000, 3000);
+            window.scrollBy({ top: 600, behavior: 'smooth' });
+        }
+    } else {
+        closeDialog();
+    }
+
+  } catch (e) {
+    console.error("处理失败:", e.message);
+    closeDialog();
+    // 失败了也要稍微滚一下，防止卡死在这个位置
+    window.scrollBy({ top: 100, behavior: 'smooth' });
+  } finally {
+    isProcessingReply = false;
   }
 }
 
-// --- AI 请求构建 ---
-
+// --- AI 接口 (不变) ---
 async function generateReplyFromAI(tweetText) {
     const config = await chrome.storage.local.get(['apiKey', 'apiUrl', 'modelName', 'systemPrompt']);
-    if (!config.apiKey) throw new Error("请填写 API Key");
+    if (!config.apiKey) throw new Error("未配置 API Key");
 
     const messages = [
         { role: "system", content: config.systemPrompt || "You are a helpful assistant." },
@@ -187,86 +205,32 @@ async function generateReplyFromAI(tweetText) {
     });
 
     if (!response || !response.success) {
-        throw new Error(response?.error || "Unknown AI Error");
+        throw new Error(response?.error || "AI Error");
     }
-
     return response.reply;
 }
 
-// --- 自动化操作核心 (加强停止检查) ---
+// --- 辅助工具函数 ---
 
-async function triggerAutoReply(tweetElement) {
-  if (!isRunning) return; // [Check 1]
-  isProcessingReply = true;
-  
-  try {
-    tweetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await randomDelay(3000); // 等待滚动结束
-
-    if (!isRunning) return; // [Check 2]
-
-    const textNode = tweetElement.querySelector('div[data-testid="tweetText"]');
-    const tweetText = textNode ? textNode.innerText : "";
-    if (!tweetText) return;
-
-    console.log(`Processing: ${tweetText.slice(0, 20)}...`);
-
-    // 1. 调用 AI
-    const replyText = await generateReplyFromAI(tweetText);
-    if (!isRunning) return; // [Check 3] AI 返回后立即检查
-    console.log(`AI Reply: ${replyText}`);
-
-    // 2. 点击回复按钮
-    const replyButton = tweetElement.querySelector('button[data-testid="reply"]');
-    if (!replyButton) throw new Error("Reply button not found");
-    
-    replyButton.click();
-    
-    // 3. 等待输入框
-    const inputBox = await waitForElement('div[role="dialog"] div[role="textbox"]', 5000);
-    if (!inputBox) throw new Error("Input box not open");
-
-    if (!isRunning) { // [Check 4] 输入前检查，如果停止了，关闭弹窗并退出
-        closeDialog(); 
-        return; 
-    }
-
-    // 4. 模拟输入
-    await simulateReactInput(inputBox, replyText);
-    await randomDelay(500, 1000);
-
-    if (!isRunning) { closeDialog(); return; } // [Check 5] 发送前最后检查
-
-    // 5. 点击发送
-    const sent = await clickSendButton();
-    if (sent) {
-        console.log("✅ Sent!");
-        updateCount(1); 
-        
-        // [关键修改] 只有发送成功后，才进行滚动
-        // 滚动距离设大一点(400-600)，确保翻过当前帖子，触发懒加载
-        await randomDelay(2000, 3000); // 等待发送动画
-        if (isRunning) {
-            window.scrollBy({ top: 600, behavior: 'smooth' });
-            await randomDelay(5000, 10000);
-            window.scrollBy({ top: 600, behavior: 'smooth' });
-            await randomDelay(120000, 150000);
-        }
-        
-    } else {
-        closeDialog();
-    }
-
-  } catch (err) {
-    console.error("Skipped:", err.message);
-    // 出错也尝试关闭弹窗，避免遮挡
-    closeDialog();
-  } finally {
-    isProcessingReply = false;
+function getTweetId(tweetElement) {
+  const link = tweetElement.querySelector('a[href*="/status/"]');
+  if (link) {
+    const parts = link.href.split('/status/');
+    if (parts.length > 1) return parts[1].split('/')[0];
   }
+  return null;
 }
 
-// 辅助：关闭弹窗
+function isMainTweet(tweetElement) {
+    const pathname = window.location.pathname;
+    if (pathname === '/' || pathname === '/home') return false; 
+    const tweetUrl = tweetElement.querySelector('a[href*="/status/"]')?.href;
+    if (tweetUrl && pathname.includes('/status/') && tweetUrl.includes(pathname.split('/status/')[1].split('/')[0])) {
+        return true;
+    }
+    return false;
+}
+
 function closeDialog() {
     const closeBtn = document.querySelector('div[role="dialog"] button[aria-label="Close"]');
     if(closeBtn) closeBtn.click();
@@ -282,7 +246,7 @@ async function simulateReactInput(element, text) {
 
 async function clickSendButton() {
     let attempts = 0;
-    while (attempts < 5) { // 减少尝试次数，加快响应
+    while (attempts < 5) { 
         if (!isRunning) return false;
         const sendButton = document.querySelector('div[role="dialog"] button[data-testid="tweetButton"]');
         if (sendButton && !sendButton.disabled && sendButton.getAttribute('aria-disabled') !== 'true') {
@@ -317,48 +281,42 @@ function updateCount(add = 0) {
     });
 }
 
-// 手动按钮注入逻辑 (保持不变)
+function randomDelay(min, max) {
+    if (!max) max = min;
+    return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
+}
+
+// --- 手动按钮注入 (可选，保持不变) ---
+const manualObserver = new MutationObserver((mutations) => {
+  if (!isRunning) { 
+      for (const mutation of mutations) {
+        if (mutation.addedNodes.length) injectButtons();
+      }
+  }
+});
+manualObserver.observe(document.body, { childList: true, subtree: true });
+
 function injectButtons() {
-    // ... (保持原有的手动按钮逻辑，代码较长此处略去，无需修改) ...
-    // 为了完整性，请确保保留原文件中的 createAIButton 和 injectButtons 函数
     const tweets = document.querySelectorAll('article[data-testid="tweet"]');
     tweets.forEach((tweet) => {
       if (tweet.querySelector(".ai-reply-btn")) return;
       const actionBar = tweet.querySelector('div[role="group"]');
       if (actionBar) {
-        const btnContainer = createAIButton(tweet);
+        const btnContainer = document.createElement("div");
+        btnContainer.className = "ai-reply-btn";
+        btnContainer.style.cssText = "display: flex; align-items: center; margin-left: 12px; cursor: pointer; color: #1d9bf0;";
+        btnContainer.innerHTML = AI_ICON;
+        btnContainer.title = "AI 生成"; 
+        btnContainer.onclick = async (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const text = tweet.querySelector('div[data-testid="tweetText"]')?.innerText || "";
+            try {
+                const reply = await generateReplyFromAI(text);
+                alert("AI 回复已复制:\n" + reply);
+                navigator.clipboard.writeText(reply);
+            } catch(err) { alert(err.message); }
+        };
         actionBar.appendChild(btnContainer);
       }
     });
-}
-
-function createAIButton(tweetElement) {
-    const container = document.createElement("div");
-    container.className = "ai-reply-btn";
-    container.style.cssText = "display: flex; align-items: center; margin-left: 12px; cursor: pointer; color: #1d9bf0;";
-    container.innerHTML = AI_ICON;
-    container.title = "AI 生成"; // 仅生成不发送
-  
-    container.addEventListener("click", async (e) => {
-      e.stopPropagation(); e.preventDefault();
-      container.style.color = "orange";
-      try {
-          const textNode = tweetElement.querySelector('div[data-testid="tweetText"]');
-          const text = textNode ? textNode.innerText : "";
-          const reply = await generateReplyFromAI(text);
-          // 手动模式流程...
-          const replyButton = tweetElement.querySelector('button[data-testid="reply"]');
-          replyButton.click();
-          const inputBox = await waitForElement('div[role="dialog"] div[role="textbox"]', 3000);
-          if (inputBox) await simulateReactInput(inputBox, reply);
-          else { alert("已复制:\n" + reply); navigator.clipboard.writeText(reply); }
-      } catch(err) { alert("错误: " + err.message); } 
-      finally { container.style.color = "#1d9bf0"; }
-    });
-    return container;
-}
-
-function randomDelay(min, max) {
-    if (!max) max = min;
-    return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
 }
