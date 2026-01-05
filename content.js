@@ -2,174 +2,223 @@
 
 // --- 全局状态 ---
 let isRunning = false;
-let processedTweetIds = new Set();
-// let scrollIntervalId = null; // [已移除] 不再需要自动滚动定时器
-let scanObserver = null;
-let replyQueue = [];
-let isProcessingReply = false;
+let processedTweetIds = new Set(); // 评论去重
+let processedLikeIds = new Set();  // 点赞去重
+let isProcessingReply = false;     // 互斥锁
 
 const AI_ICON = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z"/><path d="M12 6a1 1 0 0 0-1 1v2H9a1 1 0 0 0 0 2h2v2a1 1 0 0 0 2 0v-2h2a1 1 0 0 0 0-2h-2V7a1 1 0 0 0-1-1z"/></svg>`;
 
-// --- 初始化与消息监听 ---
-
-// 1. 发送握手信号
+// --- 初始化 ---
 chrome.runtime.sendMessage({ type: "CONTENT_READY" });
 
-// 2. 初始状态检查 (页面刷新后会执行这里)
 chrome.storage.local.get(['isRunning'], (data) => {
-  if (data.isRunning) {
-    // 稍微延迟一下，确保页面 DOM 加载了一部分
-    setTimeout(startAutomation, 1500);
-  }
+  if (data.isRunning) setTimeout(startAutomation, 3000);
 });
 
-// 3. 监听来自 Background 的消息
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (req.type === "STATE_CHANGE") {
-    const { isRunning: shouldRun } = req.payload;
-    if (shouldRun) {
-      startAutomation();
-    } else {
-      stopAutomation();
-    }
+    if (req.payload.isRunning) startAutomation();
+    else stopAutomation();
   }
   return true;
 });
 
-// 手动按钮注入
-const manualObserver = new MutationObserver((mutations) => {
-  if (!isRunning) { // 只有在不运行时才积极注入手动按钮，节省性能
-      for (const mutation of mutations) {
-        if (mutation.addedNodes.length) {
-          injectButtons();
-        }
-      }
-  }
-});
-manualObserver.observe(document.body, { childList: true, subtree: true });
-
-
-// --- 自动化核心逻辑 ---
+// --- 自动化主流程 ---
 
 async function startAutomation() {
   if (isRunning) return;
   isRunning = true;
-  console.log("AI 助手：开始自动运行...");
-
-  processedTweetIds.clear();
-
-  // [修改] 移除了 scrollIntervalId 相关的 setInterval 代码
-  // 不再自动滚动，依靠 scanObserver 捕捉当前屏，回复成功后才滚动
-
-  // 1. 启动扫描
-  scanObserver = new MutationObserver((mutations) => {
-    if (!isRunning) return;
-    mutations.forEach(mutation => {
-      mutation.addedNodes.forEach(node => {
-        if (node.nodeType === 1) {
-          if (node.tagName === 'ARTICLE' && node.getAttribute('data-testid') === 'tweet') {
-             enqueueTweet(node);
-          }
-          const tweets = node.querySelectorAll ? node.querySelectorAll('article[data-testid="tweet"]') : [];
-          tweets.forEach(tweet => enqueueTweet(tweet));
-        }
-      });
-    });
-  });
-
-  scanObserver.observe(document.body, { childList: true, subtree: true });
-
-  // 2. 立即扫描一次当前页面
-  const existingTweets = document.querySelectorAll('article[data-testid="tweet"]');
-  existingTweets.forEach(t => enqueueTweet(t));
-
-  // 3. 启动队列处理
-  processReplyQueue();
+  console.log("AI 助手：开始运行 (评论 + 点赞)...");
+  
+  automationLoop(); // 评论线程
+  autoLikeLoop();   // 点赞线程
 }
 
 function stopAutomation() {
   isRunning = false;
   console.log("AI 助手：停止运行");
-
-  // 立即清空队列
-  replyQueue = [];
-
-  if (scanObserver) {
-    scanObserver.disconnect();
-    scanObserver = null;
-  }
-  // scrollIntervalId 已移除，无需清除
 }
 
-// --- 推文过滤与排队 ---
+// === 循环 A: 自动评论 ===
+async function automationLoop() {
+  while (isRunning) {
+    const candidate = findBestCandidate();
 
-function enqueueTweet(tweetElement) {
-  if (!isRunning) return;
-
-  const tweetId = getTweetId(tweetElement);
-  if (!tweetId || processedTweetIds.has(tweetId)) {
-    return;
-  }
-
-  // 过滤广告
-  if (tweetElement.innerText.includes("Ad") || tweetElement.innerText.includes("Promoted") || tweetElement.innerText.includes("广告")) {
-      return;
-  }
-
-  // 过滤主贴
-  if (isMainTweet(tweetElement)) {
-    processedTweetIds.add(tweetId);
-    return;
-  }
-
-  processedTweetIds.add(tweetId);
-  replyQueue.push(tweetElement);
-  updateCount();
-}
-
-function getTweetId(tweetElement) {
-  const link = tweetElement.querySelector('a[href*="/status/"]');
-  if (link) {
-    const parts = link.href.split('/status/');
-    if (parts.length > 1) {
-      return parts[1].split('/')[0];
+    if (candidate) {
+      await triggerAutoReply(candidate);
+    } else {
+      // 如果没有候选且没有在写评论，小幅度滚动
+      if (!isProcessingReply) {
+        console.log("评论循环：搜寻中...");
+        window.scrollBy({ top: 300, behavior: 'smooth' });
+      }
+      await randomDelay(2000, 3000); 
     }
+  }
+}
+
+// === 循环 B: 自动点赞 ===
+async function autoLikeLoop() {
+    console.log("点赞循环：已启动");
+    while (isRunning) {
+        try {
+            // 互斥检查
+            if (isProcessingReply) {
+                await randomDelay(2000, 4000);
+                continue;
+            }
+
+            const likeCandidate = findBestLikeCandidate();
+
+            if (likeCandidate) {
+                const btn = likeCandidate.button;
+                const tweetId = likeCandidate.id;
+                
+                console.log(`❤️ 点赞推文: ${tweetId}`);
+                
+                btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                await randomDelay(1000, 2000);
+
+                if (!isRunning) break;
+                if (isProcessingReply) continue; 
+
+                btn.click();
+                processedLikeIds.add(tweetId);
+                
+                // [新增] 更新点赞计数
+                updateLikeCount(1);
+
+                console.log("❤️ 点赞完成，下滑并等待...");
+                await randomDelay(1000, 2000);
+                window.scrollBy({ top: 400, behavior: 'smooth' });
+
+                // 20 - 40 秒等待
+                await randomDelay(20 * 1000, 40 * 1000);
+
+            } else {
+                await randomDelay(2000, 5000);
+            }
+
+        } catch (e) {
+            console.error("点赞循环出错:", e);
+            await randomDelay(5000);
+        }
+    }
+}
+
+// --- 查找逻辑 ---
+
+function findBestCandidate() {
+  const allTweets = document.querySelectorAll('article[data-testid="tweet"]');
+  for (let tweet of allTweets) {
+    if (!isInViewport(tweet)) continue; 
+    const id = getTweetId(tweet);
+    if (!id || processedTweetIds.has(id)) continue;
+    const text = tweet.innerText;
+    if (text.includes("Ad") || text.includes("Promoted") || text.includes("广告")) continue;
+    if (isMainTweet(tweet)) { processedTweetIds.add(id); continue; }
+    return tweet;
   }
   return null;
 }
 
-function isMainTweet(tweetElement) {
-    const pathname = window.location.pathname;
-    if (pathname === '/' || pathname === '/home') return false; 
-    
-    const tweetUrl = tweetElement.querySelector('a[href*="/status/"]')?.href;
-    if (tweetUrl && pathname.includes('/status/') && tweetUrl.includes(pathname.split('/status/')[1].split('/')[0])) {
-        return true;
+function findBestLikeCandidate() {
+    const allTweets = document.querySelectorAll('article[data-testid="tweet"]');
+    for (let tweet of allTweets) {
+        if (!isInViewport(tweet)) continue;
+        const id = getTweetId(tweet);
+        if (!id || processedLikeIds.has(id)) continue;
+
+        const likeBtn = tweet.querySelector('button[data-testid="like"]');
+        const unlikeBtn = tweet.querySelector('button[data-testid="unlike"]');
+
+        if (unlikeBtn) {
+            processedLikeIds.add(id);
+            continue;
+        }
+        if (likeBtn) {
+            const text = tweet.innerText;
+            if (text.includes("Ad") || text.includes("Promoted") || text.includes("广告")) continue;
+            return { button: likeBtn, id: id };
+        }
     }
-    return false;
+    return null;
 }
 
-// --- 队列处理 ---
+function isInViewport(el) {
+    const rect = el.getBoundingClientRect();
+    return (
+        rect.top >= -200 && 
+        rect.top <= (window.innerHeight || document.documentElement.clientHeight)
+    );
+}
 
-async function processReplyQueue() {
-  while (isRunning) { // 循环条件本身就是第一道防线
-    if (replyQueue.length > 0 && !isProcessingReply) {
-      const tweetElement = replyQueue.shift();
-      // 再次检查元素是否还在文档中
-      if (document.body.contains(tweetElement)) {
-          await triggerAutoReply(tweetElement);
-      }
-    }
-    // 稍微等待，避免死循环占用 CPU
+// --- 评论执行逻辑 ---
+
+async function triggerAutoReply(tweetElement) {
+  if (!isRunning) return;
+  isProcessingReply = true; // 上锁
+
+  const tweetId = getTweetId(tweetElement);
+  processedTweetIds.add(tweetId); 
+
+  try {
+    tweetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    await randomDelay(1500, 2500);
+    if (!isRunning) return;
+
+    const textNode = tweetElement.querySelector('div[data-testid="tweetText"]');
+    const tweetText = textNode ? textNode.innerText : "";
+    if (!tweetText) return;
+
+    console.log(`💬 生成回复中...`);
+
+    const replyText = await generateReplyFromAI(tweetText);
+    if (!isRunning) return;
+    
+    const replyButton = tweetElement.querySelector('button[data-testid="reply"]');
+    if (!replyButton) throw new Error("无回复按钮");
+    replyButton.click();
+
+    const inputBox = await waitForElement('div[role="dialog"] div[role="textbox"]', 5000);
+    if (!inputBox) throw new Error("输入框未出现");
+    if (!isRunning) { closeDialog(); return; }
+
+    await simulateReactInput(inputBox, replyText);
     await randomDelay(1000, 2000);
+    if (!isRunning) { closeDialog(); return; }
+
+    const sent = await clickSendButton();
+
+    if (sent) {
+        updateCount(1); // 更新评论计数
+        console.log("✅ 评论发送成功");
+        isProcessingReply = false; // 立即解锁
+
+        await randomDelay(3000, 5000);
+        window.scrollBy({ top: 1200, behavior: 'smooth' });
+
+        console.log("⏳ 评论冷却 (2-3min)...");
+        await randomDelay(30 * 1000, 180 * 1000);
+        
+        if (isRunning) window.scrollBy({ top: 600, behavior: 'smooth' });
+    } else {
+        closeDialog();
+    }
+
+  } catch (e) {
+    console.error("评论失败:", e.message);
+    closeDialog();
+    window.scrollBy({ top: 100, behavior: 'smooth' });
+  } finally {
+    isProcessingReply = false; // 确保解锁
   }
 }
 
-// --- AI 请求构建 ---
-
+// --- AI 请求 ---
 async function generateReplyFromAI(tweetText) {
     const config = await chrome.storage.local.get(['apiKey', 'apiUrl', 'modelName', 'systemPrompt']);
-    if (!config.apiKey) throw new Error("请填写 API Key");
+    if (!config.apiKey) throw new Error("未配置 API Key");
 
     const messages = [
         { role: "system", content: config.systemPrompt || "You are a helpful assistant." },
@@ -181,92 +230,36 @@ async function generateReplyFromAI(tweetText) {
         payload: {
             apiKey: config.apiKey,
             apiUrl: config.apiUrl,
-            model: config.modelName,
+            model: config.modelName, // 这里会自动读取下拉菜单或自定义输入框保存的值
             messages: messages
         }
     });
 
     if (!response || !response.success) {
-        throw new Error(response?.error || "Unknown AI Error");
+        throw new Error(response?.error || "AI Error");
     }
-
     return response.reply;
 }
 
-// --- 自动化操作核心 (加强停止检查) ---
+// --- 工具函数 & 计数更新 ---
 
-async function triggerAutoReply(tweetElement) {
-  if (!isRunning) return; // [Check 1]
-  isProcessingReply = true;
-  
-  try {
-    tweetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await randomDelay(3000); // 等待滚动结束
-
-    if (!isRunning) return; // [Check 2]
-
-    const textNode = tweetElement.querySelector('div[data-testid="tweetText"]');
-    const tweetText = textNode ? textNode.innerText : "";
-    if (!tweetText) return;
-
-    console.log(`Processing: ${tweetText.slice(0, 20)}...`);
-
-    // 1. 调用 AI
-    const replyText = await generateReplyFromAI(tweetText);
-    if (!isRunning) return; // [Check 3] AI 返回后立即检查
-    console.log(`AI Reply: ${replyText}`);
-
-    // 2. 点击回复按钮
-    const replyButton = tweetElement.querySelector('button[data-testid="reply"]');
-    if (!replyButton) throw new Error("Reply button not found");
-    
-    replyButton.click();
-    
-    // 3. 等待输入框
-    const inputBox = await waitForElement('div[role="dialog"] div[role="textbox"]', 5000);
-    if (!inputBox) throw new Error("Input box not open");
-
-    if (!isRunning) { // [Check 4] 输入前检查，如果停止了，关闭弹窗并退出
-        closeDialog(); 
-        return; 
-    }
-
-    // 4. 模拟输入
-    await simulateReactInput(inputBox, replyText);
-    await randomDelay(500, 1000);
-
-    if (!isRunning) { closeDialog(); return; } // [Check 5] 发送前最后检查
-
-    // 5. 点击发送
-    const sent = await clickSendButton();
-    if (sent) {
-        console.log("✅ Sent!");
-        updateCount(1); 
-        
-        // [关键修改] 只有发送成功后，才进行滚动
-        // 滚动距离设大一点(400-600)，确保翻过当前帖子，触发懒加载
-        await randomDelay(2000, 3000); // 等待发送动画
-        if (isRunning) {
-            window.scrollBy({ top: 600, behavior: 'smooth' });
-            await randomDelay(5000, 10000);
-            window.scrollBy({ top: 600, behavior: 'smooth' });
-            await randomDelay(120000, 150000);
-        }
-        
-    } else {
-        closeDialog();
-    }
-
-  } catch (err) {
-    console.error("Skipped:", err.message);
-    // 出错也尝试关闭弹窗，避免遮挡
-    closeDialog();
-  } finally {
-    isProcessingReply = false;
+function getTweetId(tweetElement) {
+  const link = tweetElement.querySelector('a[href*="/status/"]');
+  if (link) {
+    const parts = link.href.split('/status/');
+    if (parts.length > 1) return parts[1].split('/')[0];
   }
+  return null;
 }
 
-// 辅助：关闭弹窗
+function isMainTweet(tweetElement) {
+    const pathname = window.location.pathname;
+    if (pathname === '/' || pathname === '/home') return false; 
+    const tweetUrl = tweetElement.querySelector('a[href*="/status/"]')?.href;
+    if (tweetUrl && pathname.includes('/status/') && tweetUrl.includes(pathname.split('/status/')[1].split('/')[0])) return true;
+    return false;
+}
+
 function closeDialog() {
     const closeBtn = document.querySelector('div[role="dialog"] button[aria-label="Close"]');
     if(closeBtn) closeBtn.click();
@@ -282,7 +275,7 @@ async function simulateReactInput(element, text) {
 
 async function clickSendButton() {
     let attempts = 0;
-    while (attempts < 5) { // 减少尝试次数，加快响应
+    while (attempts < 5) { 
         if (!isRunning) return false;
         const sendButton = document.querySelector('div[role="dialog"] button[data-testid="tweetButton"]');
         if (sendButton && !sendButton.disabled && sendButton.getAttribute('aria-disabled') !== 'true') {
@@ -309,6 +302,7 @@ function waitForElement(selector, timeout) {
     });
 }
 
+// 更新评论数
 function updateCount(add = 0) {
     chrome.storage.local.get(['totalReplies'], (data) => {
         const newCount = (data.totalReplies || 0) + add;
@@ -317,48 +311,52 @@ function updateCount(add = 0) {
     });
 }
 
-// 手动按钮注入逻辑 (保持不变)
-function injectButtons() {
-    // ... (保持原有的手动按钮逻辑，代码较长此处略去，无需修改) ...
-    // 为了完整性，请确保保留原文件中的 createAIButton 和 injectButtons 函数
-    const tweets = document.querySelectorAll('article[data-testid="tweet"]');
-    tweets.forEach((tweet) => {
-      if (tweet.querySelector(".ai-reply-btn")) return;
-      const actionBar = tweet.querySelector('div[role="group"]');
-      if (actionBar) {
-        const btnContainer = createAIButton(tweet);
-        actionBar.appendChild(btnContainer);
-      }
+// [新增] 更新点赞数
+function updateLikeCount(add = 0) {
+    chrome.storage.local.get(['totalLikes'], (data) => {
+        const newCount = (data.totalLikes || 0) + add;
+        if(add > 0) chrome.storage.local.set({ totalLikes: newCount });
+        // 发送特定消息给 Popup 更新 UI
+        chrome.runtime.sendMessage({ type: "UPDATE_LIKES", payload: { count: newCount } }).catch(()=>{});
     });
-}
-
-function createAIButton(tweetElement) {
-    const container = document.createElement("div");
-    container.className = "ai-reply-btn";
-    container.style.cssText = "display: flex; align-items: center; margin-left: 12px; cursor: pointer; color: #1d9bf0;";
-    container.innerHTML = AI_ICON;
-    container.title = "AI 生成"; // 仅生成不发送
-  
-    container.addEventListener("click", async (e) => {
-      e.stopPropagation(); e.preventDefault();
-      container.style.color = "orange";
-      try {
-          const textNode = tweetElement.querySelector('div[data-testid="tweetText"]');
-          const text = textNode ? textNode.innerText : "";
-          const reply = await generateReplyFromAI(text);
-          // 手动模式流程...
-          const replyButton = tweetElement.querySelector('button[data-testid="reply"]');
-          replyButton.click();
-          const inputBox = await waitForElement('div[role="dialog"] div[role="textbox"]', 3000);
-          if (inputBox) await simulateReactInput(inputBox, reply);
-          else { alert("已复制:\n" + reply); navigator.clipboard.writeText(reply); }
-      } catch(err) { alert("错误: " + err.message); } 
-      finally { container.style.color = "#1d9bf0"; }
-    });
-    return container;
 }
 
 function randomDelay(min, max) {
     if (!max) max = min;
     return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
+}
+
+// --- 手动按钮注入 (不变) ---
+const manualObserver = new MutationObserver((mutations) => {
+  if (!isRunning) { 
+      for (const mutation of mutations) {
+        if (mutation.addedNodes.length) injectButtons();
+      }
+  }
+});
+manualObserver.observe(document.body, { childList: true, subtree: true });
+
+function injectButtons() {
+    const tweets = document.querySelectorAll('article[data-testid="tweet"]');
+    tweets.forEach((tweet) => {
+      if (tweet.querySelector(".ai-reply-btn")) return;
+      const actionBar = tweet.querySelector('div[role="group"]');
+      if (actionBar) {
+        const btnContainer = document.createElement("div");
+        btnContainer.className = "ai-reply-btn";
+        btnContainer.style.cssText = "display: flex; align-items: center; margin-left: 12px; cursor: pointer; color: #1d9bf0;";
+        btnContainer.innerHTML = AI_ICON;
+        btnContainer.title = "AI 生成"; 
+        btnContainer.onclick = async (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const text = tweet.querySelector('div[data-testid="tweetText"]')?.innerText || "";
+            try {
+                const reply = await generateReplyFromAI(text);
+                alert("AI 回复已复制:\n" + reply);
+                navigator.clipboard.writeText(reply);
+            } catch(err) { alert(err.message); }
+        };
+        actionBar.appendChild(btnContainer);
+      }
+    });
 }

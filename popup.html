@@ -36,44 +36,39 @@
       justify-content:space-between;
     }
     .badge{
-      font-size:12px;
-      padding:4px 10px;
-      border-radius:999px;
-      border:1px solid var(--border);
-      color:var(--muted);
-      background:#fff;
+      font-size:11px; padding:2px 8px; border-radius:10px; font-weight:normal;
+      background:#eee; color:#666;
     }
-    .badge.running{ border-color:#00b894; color:#00b894; background:#e6fffa; }
-    .badge.stopped{ border-color:#ff7675; color:#ff7675; background:#fff5f5; }
+    .badge.running{ background:var(--primary); color:#fff; }
+    .badge.stopped{ background:#eee; color:#666; }
 
-    label{ display:block; font-size:12px; font-weight:700; color:var(--muted); margin-top:10px; }
-    label:first-child{ margin-top:0; }
-    input,textarea{
-      width:100%;
-      box-sizing:border-box;
-      border:1px solid var(--border);
-      border-radius:10px;
-      padding:9px 10px;
-      margin-top:6px;
-      font-size:13px;
-      outline:none;
-      background:#fff;
-      color:var(--text);
+    label{
+      font-size:12px; font-weight:600; color:var(--muted);
+      margin-top:12px; display:block; margin-bottom:4px;
     }
-    input:focus,textarea:focus{ border-color:var(--primary); }
-    textarea{ height:78px; resize:vertical; }
+    input, textarea, select{
+      width:100%; box-sizing:border-box;
+      background:var(--bg); border:1px solid var(--border);
+      border-radius:8px; padding:8px; font-size:13px; color:var(--text);
+      outline:none; transition:border .2s;
+    }
+    input:focus, textarea:focus, select:focus{ border-color:var(--primary); }
+    
+    /* 隐藏类，用于自定义模型输入框的切换 */
+    .hidden { display: none; }
 
-    .row{
-      display:flex; justify-content:space-between; align-items:center;
-      font-size:14px;
+    .stat-row {
+      display: flex; justify-content: space-around;
+      margin-top: 10px; padding-top: 10px;
+      border-top: 1px solid var(--border);
     }
-    .value{ font-weight:900; color:var(--primary); font-size:16px; }
+    .stat-item { text-align: center; }
+    .stat-num { font-size: 18px; font-weight: 800; color: var(--primary); display: block; }
+    .stat-label { font-size: 11px; color: var(--muted); }
 
     .error{
-      margin-top:10px;
-      font-size:12px;
-      color:var(--danger);
-      line-height:1.35;
+      color:var(--danger); font-size:12px; margin-top:8px;
+      background:rgba(244,33,46,.1); padding:8px; border-radius:6px;
       display:none;
     }
 
@@ -100,31 +95,41 @@
     <label>API Key</label>
     <input id="apiKey" type="password" placeholder="sk-..." />
 
-    <label>模型 Model</label>
-    <input id="modelName" placeholder="gpt-3.5-turbo" />
+    <label>AI 模型 Model</label>
+    <select id="modelSelect">
+        <option value="gpt-5-chat-latest">gpt-5-chat-latest (OpenAI)</option>
+        <option value="gpt-5-mini">gpt-5-mini (OpenAI)</option>
+        <option value="gpt-4o">GPT-4o (OpenAI)</option>
+        <option value="gpt-4-turbo">GPT-4 Turbo (OpenAI)</option>
+        <option value="claude-3-5-sonnet-20240620">Claude 3.5 Sonnet</option>
+        <option value="claude-3-opus-20240229">Claude 3 Opus</option>
+        <option value="gemini-pro">Gemini Pro</option>
+        <option value="custom">自定义 (Custom)...</option>
+    </select>
+    <input id="modelName" class="hidden" placeholder="输入自定义模型名称" style="margin-top: 5px;" />
 
-    <label>系统指令 System Prompt</label>
-    <textarea id="systemPrompt"></textarea>
-
+    <label>系统指令 (System Prompt)</label>
+    <textarea id="systemPrompt" rows="3" placeholder="你是一个真实网友..."></textarea>
+    
     <div id="error" class="error"></div>
   </div>
 
-  <div class="card" style="padding:12px 16px;">
-    <div class="row">
-      <span>累计评论次数</span>
-      <span id="count" class="value">0</span>
+  <div class="card">
+    <div class="stat-row">
+      <div class="stat-item">
+        <span id="count" class="stat-num">0</span>
+        <span class="stat-label">已评论</span>
+      </div>
+      <div class="stat-item">
+        <span id="likeCount" class="stat-num">0</span>
+        <span class="stat-label">已点赞</span>
+      </div>
     </div>
+    <div class="actionWrap">
+      <button id="toggleBtn">启动</button>
+    </div>
+    <div class="foot">打开 X/Twitter 页面后点击启动<br>每 2-3 分钟评论一次，每 20-40 秒点赞一次</div>
   </div>
-
-  <div class="actionWrap">
-    <button id="toggleBtn">启动</button>
-  </div>
-
-<div class="foot">
-  防封安全模式已开启<br/>
-  每条回复间隔 60~120 秒<br/>
-  点击停止后，当前正在进行的任务会立即终止
-</div>
 
   <script src="popup.js"></script>
 </body>
